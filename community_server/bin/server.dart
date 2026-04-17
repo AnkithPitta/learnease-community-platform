@@ -1071,7 +1071,6 @@ void main(List<String> args) async {
       final data = jsonDecode(body) as Map<String, dynamic>;
       final email = (data['email'] as String?)?.trim().toLowerCase();
       final password = data['password'] as String?;
-      // Passkey removed
       
       print('👨‍💼 [ADMIN_LOGIN] Attempt for email: $email');
       
@@ -1080,8 +1079,31 @@ void main(List<String> args) async {
         return Response(400, body: jsonEncode({'error': 'Missing credentials'}), headers: {'Content-Type': 'application/json'});
       }
 
-      // Verify user credentials
-      final user = await _dbGetUserByEmail(email);
+      // ✅ Try MongoDB first, then fall back to SQLite
+      Map<String, dynamic>? user;
+      
+      // Try MongoDB
+      if (mongoUsersCollection != null) {
+        try {
+          final mongoUser = await mongoUsersCollection!.findOne(where.eq('email', email));
+          if (mongoUser != null) {
+            user = {
+              'id': mongoUser['id'],
+              'email': mongoUser['email'],
+              'password_hash': mongoUser['password_hash'],
+              'username': mongoUser['username'],
+              'role': mongoUser['role']
+            };
+            print('👨‍💼 [ADMIN_LOGIN] Found admin in MongoDB: $email (role: ${user['role']})');
+          }
+        } catch (e) {
+          print('⚠️ [ADMIN_LOGIN] MongoDB lookup failed, trying SQLite: $e');
+        }
+      }
+      
+      // Fallback to SQLite if not found in MongoDB
+      user ??= await _dbGetUserByEmail(email);
+      
       if (user == null) {
         print('❌ [ADMIN_LOGIN] User not found for email: $email');
         return Response(401, body: jsonEncode({'error': 'Invalid credentials'}), headers: {'Content-Type': 'application/json'});
@@ -1103,16 +1125,28 @@ void main(List<String> args) async {
       // Passkey verification removed
       
       // Issue tokens with admin role
-      final userId = user['id']?.toString();
+      var userId = user['id']?.toString();
+      
+      // ✅ FIX: If user doesn't have an id, generate one and update the record
       if (userId == null || userId.isEmpty) {
-        print('❌ [ADMIN_LOGIN] User id missing for $email');
-        return Response.internalServerError(
-          body: jsonEncode({'error': 'User record is missing id'}),
-          headers: {'Content-Type': 'application/json'},
-        );
+        print('⚠️ [ADMIN_LOGIN] User id missing for $email, generating new one');
+        userId = uuid.v4();
+        
+        // Update user record with the new id
+        try {
+          if (dbAvailable) {
+            db.execute('UPDATE users SET id = ? WHERE email = ?', [userId, email]);
+            print('✅ [ADMIN_LOGIN] Generated and stored new id: $userId for $email');
+          }
+        } catch (e) {
+          print('⚠️ [ADMIN_LOGIN] Failed to update user id: $e');
+        }
+        
+        user['id'] = userId;
       }
+      
       final tokens = _issueTokens(userId, email, role: 'admin');
-      print('✅ [ADMIN_LOGIN] Admin tokens issued for $email');
+      print('✅ [ADMIN_LOGIN] Admin tokens issued for $email with role=admin');
       
       return Response.ok(jsonEncode({
         'token': tokens['accessToken'],
@@ -1410,12 +1444,27 @@ void main(List<String> args) async {
       print('[LOGIN OTP] Email send result: ${sent ? 'SUCCESS' : 'FAILURE'}');
 
       if (!sent) {
+        // ✅ DEV MODE: Allow demo/testing by returning OTP if email fails
+        final devMode = (Platform.environment['DEV_MODE'] ?? _readLocalEnvTop('DEV_MODE') ?? '').toLowerCase();
+        if (devMode == '1' || devMode == 'true' || devMode == 'yes') {
+          print('[LOGIN OTP] 🔧 DEV MODE ACTIVE - Returning OTP code in response');
+          return Response.ok(
+            jsonEncode({
+              'sent': true,
+              'message': 'OTP would be sent (DEV MODE - returned in response)',
+              'devCode': code,  // For demo purposes only!
+              'devNote': 'This is for development/demo only. In production, email must be sent.'
+            }),
+            headers: {'Content-Type': 'application/json'},
+          );
+        }
+        
         _dbDeleteEmailOtp(email);
         return Response(
           503,
           body: jsonEncode({
             'sent': false,
-            'error': 'Unable to send OTP email right now. Please try again in a moment.'
+            'error': 'Unable to send OTP email. Check SMTP configuration or enable DEV_MODE=true'
           }),
           headers: {'Content-Type': 'application/json'},
         );
@@ -1459,12 +1508,27 @@ void main(List<String> args) async {
       print('[SIGNUP OTP] Email send result: ${sent ? 'SUCCESS' : 'FAILURE'}');
 
       if (!sent) {
+        // ✅ DEV MODE: Allow demo/testing by returning OTP if email fails
+        final devMode = (Platform.environment['DEV_MODE'] ?? _readLocalEnvTop('DEV_MODE') ?? '').toLowerCase();
+        if (devMode == '1' || devMode == 'true' || devMode == 'yes') {
+          print('[SIGNUP OTP] 🔧 DEV MODE ACTIVE - Returning OTP code in response');
+          return Response.ok(
+            jsonEncode({
+              'sent': true,
+              'message': 'OTP would be sent (DEV MODE - returned in response)',
+              'devCode': code,  // For demo purposes only!
+              'devNote': 'This is for development/demo only. In production, email must be sent.'
+            }),
+            headers: {'Content-Type': 'application/json'},
+          );
+        }
+        
         _dbDeleteEmailOtp(email);
         return Response(
           503,
           body: jsonEncode({
             'sent': false,
-            'error': 'Unable to send OTP email right now. Please try again in a moment.'
+            'error': 'Unable to send OTP email. Check SMTP configuration or enable DEV_MODE=true'
           }),
           headers: {'Content-Type': 'application/json'},
         );
