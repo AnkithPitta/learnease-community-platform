@@ -16,7 +16,6 @@ void main() async {
   
   print('');
   
-  // Read from environment variable (Vardhan's MongoDB Atlas account)
   final mongoUri = Platform.environment['MONGODB_URI'];
   
   if (mongoUri == null) {
@@ -113,7 +112,7 @@ void main() async {
       }
     }
     
-    print('\n' + '=' * 60);
+    print('\n${'=' * 60}');
     print('SUMMARY:');
     print('=' * 60);
     print('Email: admin@learnease.com');

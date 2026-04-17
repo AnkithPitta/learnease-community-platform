@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 /// API Configuration - Automatically selects correct backend URL
 /// based on environment (development, production, etc.)
@@ -10,34 +11,55 @@ class ApiConfig {
   static const String _productionBaseUrl = 'https://learnease-community-platform.onrender.com';
   
   // Development/Local URLs
-  static const String _developmentBaseUrl = 'http://localhost:8080';
+  // Use IPv4 loopback explicitly to avoid IPv6 localhost (::1) issues in browsers
+  // when the server is bound to IPv4 only.
+  static const String _developmentBaseUrl = 'http://127.0.0.1:8081';
+
+  static String _envBaseUrl() {
+    try {
+      final v = dotenv.env['API_BASE_URL'];
+      if (v == null) return '';
+      final trimmed = v.trim();
+
+      // If the override uses localhost, normalize to IPv4 loopback for Flutter Web.
+      // This prevents "ClientException: Failed to fetch" when localhost resolves to ::1.
+      try {
+        final uri = Uri.parse(trimmed);
+        if (uri.hasScheme && uri.host == 'localhost') {
+          return uri.replace(host: '127.0.0.1').toString();
+        }
+      } catch (_) {
+        // If it's not a valid URI, just return raw string.
+      }
+
+      return trimmed;
+    } catch (_) {
+      return '';
+    }
+  }
   
   /// Get the appropriate base URL based on environment
   static String get baseUrl {
-    // TEMPORARY: Always use production for testing
-    // This ensures the app connects to Render server even in debug mode
+    // Use local backend in debug mode, production otherwise
+    if (kDebugMode) {
+      final envUrl = _envBaseUrl();
+      if (envUrl.isNotEmpty) return envUrl;
+      return _developmentBaseUrl;
+    }
     return _productionBaseUrl;
-    
-    // ORIGINAL CODE (uncomment for local development):
-    // if (kDebugMode) {
-    //   return _developmentBaseUrl;
-    // }
-    // return _productionBaseUrl;
   }
   
   /// Alternative: Check if running on web (Firebase)
   /// Returns production URL for web deployment
   /// ALWAYS returns production for consistency with baseUrl
   static String get webBaseUrl {
-    // ALWAYS use production URL for consistency
-    // This ensures all API calls go to Render backend
+    // Use local backend in debug mode, production otherwise
+    if (kDebugMode) {
+      final envUrl = _envBaseUrl();
+      if (envUrl.isNotEmpty) return envUrl;
+      return _developmentBaseUrl;
+    }
     return _productionBaseUrl;
-    
-    // ORIGINAL CODE (uncomment if you need localhost backend):
-    // if (kDebugMode) {
-    //   return _developmentBaseUrl;
-    // }
-    // return _productionBaseUrl;
   }
   
   /// Health check endpoint

@@ -38,34 +38,40 @@ void main(List<String> args) {
 
   // Read credentials from environment variables or .env file
   // Usage:
-  //   dart run setup_admin_user.dart [email] [password] [passkey]
-  //   OR set ADMIN_EMAIL, ADMIN_PASSWORD, ADMIN_PASSKEY env vars
-  //   OR create .env file with those variables
+    //   dart run setup_admin_user.dart [email] [password]
+    //   OR set ADMIN_EMAIL, ADMIN_PASSWORD env vars
+    //   OR create .env file with those variables
 
-  final adminEmail = args.isNotEmpty
+    final adminEmail = args.isNotEmpty
       ? args[0].toLowerCase()
       : (_getEnv('ADMIN_EMAIL')?.toLowerCase() ?? 'admin@learnease.com').toLowerCase();
-  
-  final adminPassword = args.length > 1
+
+    final adminPassword = args.length > 1
       ? args[1]
       : (_getEnv('ADMIN_PASSWORD') ?? 'admin@123');
   
-  final adminPasskey = args.length > 2
-      ? args[2]
-      : (_getEnv('ADMIN_PASSKEY') ?? 'admin_secure_passkey_12345');
-  
   // Connect to the database
   final db = sqlite3.open('users.db');
-  
-  // Hash the password and passkey with BCrypt
+
+  // Create users table if it does not exist
+  db.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE,
+      password_hash TEXT,
+      created_at TEXT,
+      username TEXT,
+      admin_passkey TEXT
+    );
+  ''');
+
+  // Hash the password with BCrypt
   final passwordHash = BCrypt.hashpw(adminPassword, BCrypt.gensalt());
-  final passkeyHash = BCrypt.hashpw(adminPasskey, BCrypt.gensalt());
-  
+
   print('✅ Credentials loaded from: ${args.isNotEmpty ? 'command-line arguments' : 'environment variables / .env file'}');
   print('Admin Email: $adminEmail');
   print('Password Hash: ${passwordHash.substring(0, 30)}...');
-  print('Passkey Hash: ${passkeyHash.substring(0, 30)}...\n');
-  
+
   // Check if admin already exists
   try {
     final existing = db.select('SELECT id, email FROM users WHERE email = ?', [adminEmail]);
@@ -76,7 +82,7 @@ void main(List<String> args) {
       
       // Update the password and passkey
       print('\n🔄 Updating admin credentials...');
-      db.execute('UPDATE users SET password_hash = ?, admin_passkey = ? WHERE email = ?', [passwordHash, passkeyHash, adminEmail]);
+      db.execute('UPDATE users SET password_hash = ? WHERE email = ?', [passwordHash, adminEmail]);
       print('✅ Admin credentials updated!');
     } else {
       throw Exception('Admin user not found');
@@ -85,15 +91,14 @@ void main(List<String> args) {
     print('⚠️  Creating new admin user...');
     try {
       db.execute('''
-        INSERT INTO users (id, email, password_hash, created_at, username, admin_passkey)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO users (id, email, password_hash, created_at, username)
+        VALUES (?, ?, ?, ?, ?)
       ''', [
         'admin-user-001',
         adminEmail,
         passwordHash,
         DateTime.now().toIso8601String(),
         'admin',
-        passkeyHash,
       ]);
       print('✅ Admin user created successfully!');
     } catch (createError) {

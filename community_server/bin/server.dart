@@ -11,8 +11,8 @@ import 'package:bcrypt/bcrypt.dart';
 import 'package:uuid/uuid.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:mongo_dart/mongo_dart.dart';
-import 'package:googleapis/gmail/v1.dart' as gmail;
-import 'package:googleapis_auth/auth_io.dart' as auth;
+import 'package:mailer/mailer.dart';
+import 'package:mailer/smtp_server.dart';
 
 // In-memory storage (replace with database in production)
 // MongoDB connection for contributions
@@ -290,23 +290,129 @@ void _dbRevokeSession(String refreshToken) {
   }
 }
 
+String? _asNullableString(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+  if (value is String) {
+    return value;
+  }
+  return value.toString();
+}
+
+Map<String, dynamic> _normalizeMongoUser(Map<String, dynamic> mongoUser) {
+  final resolvedId = _asNullableString(mongoUser['id']) ?? _asNullableString(mongoUser['_id']);
+  return {
+    'id': resolvedId,
+    'email': _asNullableString(mongoUser['email']),
+    'password_hash': _asNullableString(mongoUser['password_hash']),
+    'phone': _asNullableString(mongoUser['phone']),
+    'google_id': _asNullableString(mongoUser['google_id']),
+    'created_at': _asNullableString(mongoUser['created_at']),
+    'username': _asNullableString(mongoUser['username']),
+    'admin_passkey': _asNullableString(mongoUser['admin_passkey']),
+  };
+}
+
 // User helpers (DB-backed)
+Future<Map<String, dynamic>?> _dbGetUserById(String id) async {
+  // Try MongoDB first (production)
+  if (mongoUsersCollection != null) {
+    try {
+      final mongoUser = await mongoUsersCollection!.findOne(where.eq('id', id));
+      if (mongoUser != null) {
+        return _normalizeMongoUser(mongoUser);
+      }
+    } catch (e) {
+      print('[MongoDB] Error fetching user by id: $e');
+    }
+  }
+  // Fall back to SQLite (local development)
+  if (!dbAvailable) {
+    try {
+      return usersCache.firstWhere((u) => u['id'] == id);
+    } catch (_) {
+      return null;
+    }
+  }
+  final ResultSet rs = db.select('SELECT * FROM users WHERE id = ?;', [id]);
+  if (rs.isEmpty) return null;
+  final row = rs.first;
+  return {
+    'id': row['id'] as String,
+    'email': row['email'] as String?,
+    'password_hash': row['password_hash'] as String?,
+    'phone': row['phone'] as String?,
+    'google_id': row['google_id'] as String?,
+    'created_at': row['created_at'] as String?,
+    'username': row['username'] as String?,
+    'admin_passkey': row['admin_passkey'] as String?,
+  };
+}
+
+// Ensure there is at least one default admin user in MongoDB
+Future<void> _ensureDefaultAdminUser() async {
+  try {
+    if (mongoUsersCollection == null) {
+      print('⚠️ [ADMIN_BOOTSTRAP] mongoUsersCollection is null, skipping admin seed');
+      return;
+    }
+
+    final adminEmail = (
+      Platform.environment['ADMIN_EMAIL'] ??
+      _readLocalEnvTop('ADMIN_EMAIL', path: 'community_server/.env') ??
+      _readLocalEnvTop('ADMIN_EMAIL') ??
+      'admin@learnease.com'
+    ).trim().toLowerCase();
+
+    final adminPassword = (
+      Platform.environment['ADMIN_PASSWORD'] ??
+      _readLocalEnvTop('ADMIN_PASSWORD', path: 'community_server/.env') ??
+      _readLocalEnvTop('ADMIN_PASSWORD') ??
+      'Admin@123'
+    ).trim();
+
+    print('🔧 [ADMIN_BOOTSTRAP] Ensuring default admin user exists for email: $adminEmail');
+
+    final existing = await mongoUsersCollection!.findOne(where.eq('email', adminEmail));
+
+    final passwordHash = BCrypt.hashpw(adminPassword, BCrypt.gensalt());
+
+    if (existing != null) {
+      // Update password hash if needed, keep other fields intact
+      await mongoUsersCollection!.updateOne(
+        where.eq('email', adminEmail),
+        modify.set('password_hash', passwordHash),
+      );
+      print('✅ [ADMIN_BOOTSTRAP] Admin user already exists, password updated');
+      return;
+    }
+
+    final newId = uuid.v4();
+    final createdAt = DateTime.now().toIso8601String();
+
+    await mongoUsersCollection!.insertOne({
+      'id': newId,
+      'email': adminEmail,
+      'password_hash': passwordHash,
+      'username': 'admin',
+      'role': 'admin',
+      'created_at': createdAt,
+    });
+
+    print('✅ [ADMIN_BOOTSTRAP] Default admin user created in MongoDB');
+  } catch (e, st) {
+    print('❌ [ADMIN_BOOTSTRAP] Failed to ensure admin user: $e');
+    print('❌ [ADMIN_BOOTSTRAP] StackTrace: $st');
+  }
+}
 Future<Map<String, dynamic>?> _dbGetUserByEmail(String email) async {
   // Try MongoDB first (production)
   if (mongoUsersCollection != null) {
     try {
       final mongoUser = await mongoUsersCollection!.findOne(where.eq('email', email));
       if (mongoUser != null) {
-        return {
-          'id': mongoUser['id'] as String?,
-          'email': mongoUser['email'] as String?,
-          'password_hash': mongoUser['password_hash'] as String?,  // Keep snake_case for consistency
-          'phone': mongoUser['phone'] as String?,
-          'google_id': mongoUser['google_id'] as String?,  // Keep snake_case
-          'created_at': mongoUser['created_at'] as String?,  // Keep snake_case
-          'username': mongoUser['username'] as String?,
-          'admin_passkey': mongoUser['admin_passkey'] as String?,
-        };
+        return _normalizeMongoUser(mongoUser);
       }
     } catch (e) {
       print('[MongoDB] Error fetching user by email: $e');
@@ -358,48 +464,6 @@ Map<String, dynamic>? _dbGetUserByPhone(String phone) {
   };
 }
 
-Future<Map<String, dynamic>?> _dbGetUserById(String id) async {
-  // Try MongoDB first (production)
-  if (mongoUsersCollection != null) {
-    try {
-      final mongoUser = await mongoUsersCollection!.findOne(where.eq('id', id));
-      if (mongoUser != null) {
-        return {
-          'id': mongoUser['id'] as String?,
-          'email': mongoUser['email'] as String?,
-          'password_hash': mongoUser['password_hash'] as String?,  // Keep snake_case for consistency
-          'phone': mongoUser['phone'] as String?,
-          'google_id': mongoUser['google_id'] as String?,  // Keep snake_case
-          'created_at': mongoUser['created_at'] as String?,  // Keep snake_case
-          'username': mongoUser['username'] as String?,
-        };
-      }
-    } catch (e) {
-      print('[MongoDB] Error fetching user by ID: $e');
-    }
-  }
-  
-  // Fall back to SQLite (local development)
-  if (!dbAvailable) {
-    try {
-      return usersCache.firstWhere((u) => u['id'] == id);
-    } catch (_) {
-      return null;
-    }
-  }
-  final ResultSet rs = db.select('SELECT * FROM users WHERE id = ?;', [id]);
-  if (rs.isEmpty) return null;
-  final row = rs.first;
-  return {
-    'id': row['id'] as String,
-    'email': row['email'] as String?,
-    'password_hash': row['password_hash'] as String?,
-    'phone': row['phone'] as String?,
-    'google_id': row['google_id'] as String?,
-    'created_at': row['created_at'] as String?,
-    'username': row['username'] as String?,
-  };
-}
 
 Future<void> _dbInsertUser({required String id, String? email, String? password_hash, String? phone, String? google_id, required String created_at, String? username}) async {
   // PRIMARY: Insert to MongoDB (production database)
@@ -526,83 +590,97 @@ void _dbDeleteEmailOtp(String email) {
   }
 }
 
-// Send email via Gmail API (HTTPS - port 443, works on Render free tier)
+String _normalizeSecret(String value, {bool removeAllWhitespace = false}) {
+  var normalized = value.trim();
+  if ((normalized.startsWith('"') && normalized.endsWith('"')) ||
+      (normalized.startsWith("'") && normalized.endsWith("'"))) {
+    normalized = normalized.substring(1, normalized.length - 1).trim();
+  }
+  if (removeAllWhitespace) {
+    normalized = normalized.replaceAll(RegExp(r'\s+'), '');
+  }
+  return normalized;
+}
+
+String _sanitizeGmailAppPassword(String value) {
+  // Gmail app passwords are 16 alphanumeric chars. Users often paste with
+  // spaces or hidden punctuation from password managers.
+  return value.replaceAll(RegExp(r'[^A-Za-z0-9]'), '');
+}
+
+// Send email via SMTP
 Future<bool> _sendEmail(String to, String subject, String body) async {
   print('[EMAIL] Attempting to send email to: $to');
   try {
-    // Read Gmail API credentials from environment
-    var clientId = Platform.environment['GMAIL_CLIENT_ID'];
-    clientId ??= _readLocalEnvTop('GMAIL_CLIENT_ID', path: 'community_server/.env');
-    clientId ??= _readLocalEnvTop('GMAIL_CLIENT_ID', path: '.env');
-    
-    var clientSecret = Platform.environment['GMAIL_CLIENT_SECRET'];
-    clientSecret ??= _readLocalEnvTop('GMAIL_CLIENT_SECRET', path: 'community_server/.env');
-    clientSecret ??= _readLocalEnvTop('GMAIL_CLIENT_SECRET', path: '.env');
-    
-    var refreshToken = Platform.environment['GMAIL_REFRESH_TOKEN'];
-    refreshToken ??= _readLocalEnvTop('GMAIL_REFRESH_TOKEN', path: 'community_server/.env');
-    refreshToken ??= _readLocalEnvTop('GMAIL_REFRESH_TOKEN', path: '.env');
-    
-    var userEmail = Platform.environment['GMAIL_USER_EMAIL'];
-    userEmail ??= _readLocalEnvTop('GMAIL_USER_EMAIL', path: 'community_server/.env');
-    userEmail ??= _readLocalEnvTop('GMAIL_USER_EMAIL', path: '.env');
-    
-    print('[EMAIL] GMAIL_CLIENT_ID: ' + (clientId != null ? 'present' : 'null'));
-    print('[EMAIL] GMAIL_CLIENT_SECRET: ' + (clientSecret != null ? '***hidden***' : 'null'));
-    print('[EMAIL] GMAIL_REFRESH_TOKEN: ' + (refreshToken != null ? '***hidden***' : 'null'));
-    print('[EMAIL] GMAIL_USER_EMAIL: ' + (userEmail ?? 'null'));
-    
-    if (clientId == null || clientSecret == null || refreshToken == null || userEmail == null) {
-      print('⚠️ Gmail API not configured. Missing: GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, or GMAIL_USER_EMAIL');
+    // Prefer workspace .env values first so local runs are deterministic.
+    var smtpUser = _readLocalEnvTop('SMTP_USER', path: 'community_server/.env');
+    smtpUser ??= _readLocalEnvTop('SMTP_USER', path: '.env');
+    smtpUser ??= Platform.environment['SMTP_USER'];
+
+    var smtpPassword = _readLocalEnvTop('SMTP_PASSWORD', path: 'community_server/.env');
+    smtpPassword ??= _readLocalEnvTop('SMTP_PASSWORD', path: '.env');
+    smtpPassword ??= _readLocalEnvTop('GMAIL_APP_PASSWORD', path: 'community_server/.env');
+    smtpPassword ??= _readLocalEnvTop('GMAIL_APP_PASSWORD', path: '.env');
+    smtpPassword ??= Platform.environment['SMTP_PASSWORD'];
+    smtpPassword ??= Platform.environment['GMAIL_APP_PASSWORD'];
+
+    var smtpHost = _readLocalEnvTop('SMTP_HOST', path: 'community_server/.env') ?? _readLocalEnvTop('SMTP_HOST', path: '.env') ?? Platform.environment['SMTP_HOST'] ?? 'smtp.gmail.com';
+    var smtpPort = int.tryParse(_readLocalEnvTop('SMTP_PORT', path: 'community_server/.env') ?? _readLocalEnvTop('SMTP_PORT', path: '.env') ?? Platform.environment['SMTP_PORT'] ?? '587') ?? 587;
+
+    if (smtpUser == null || smtpPassword == null) {
+      print('⚠️ SMTP not configured. Missing: SMTP_USER or SMTP_PASSWORD');
       return false;
     }
-    
-    print('[EMAIL] Creating OAuth2 credentials with refresh token...');
-    
-    // Create OAuth2 credentials with refresh token
-    final credentials = auth.AccessCredentials(
-      auth.AccessToken('Bearer', '', DateTime.now().toUtc()),
-      refreshToken,
-      ['https://www.googleapis.com/auth/gmail.send'],
+
+    smtpUser = _normalizeSecret(smtpUser);
+    smtpPassword = _normalizeSecret(smtpPassword);
+
+    print('[EMAIL] Raw SMTP_USER from config: $smtpUser');
+    print('[EMAIL] Normalized SMTP_USER: ${smtpUser.trim()}');
+
+    final isGmail = smtpHost.toLowerCase().contains('gmail.com');
+    if (isGmail) {
+      // Gmail app passwords are commonly copied with spaces or hidden symbols.
+      smtpPassword = _sanitizeGmailAppPassword(
+        _normalizeSecret(smtpPassword, removeAllWhitespace: true),
+      );
+      print('[EMAIL] Gmail detected. Sanitized password length: ${smtpPassword.length} chars');
+      final pwLen = smtpPassword.length;
+      if (pwLen >= 8) {
+        print('[EMAIL] Sanitized password (first 4 + last 4): ${smtpPassword.substring(0, 4)}***${smtpPassword.substring(pwLen - 4)}');
+      }
+      if (smtpPassword.length != 16) {
+        print('[EMAIL] Warning: Gmail app password length is ${smtpPassword.length}, expected 16.');
+      }
+    }
+
+    final useSsl = smtpPort == 465;
+
+    final smtpServer = SmtpServer(
+      smtpHost,
+      port: smtpPort,
+      username: smtpUser,
+      password: smtpPassword,
+      ssl: useSsl,
+      allowInsecure: false,
     );
-    
-    // Create authenticated HTTP client
-    final clientCredentials = auth.ClientId(clientId, clientSecret);
-    final httpClient = await auth.autoRefreshingClient(
-      clientCredentials,
-      credentials,
-      http.Client(),
-    );
-    
-    print('[EMAIL] Creating Gmail API client...');
-    final gmailApi = gmail.GmailApi(httpClient);
-    
-    // Construct RFC 2822 email message
-    final emailLines = <String>[
-      'From: LearnEase <$userEmail>',
-      'To: $to',
-      'Subject: $subject',
-      'Content-Type: text/html; charset=utf-8',
-      '',
-      body,
-    ];
-    final emailContent = emailLines.join('\r\n');
-    
-    // Base64url encode the message (Gmail API requirement)
-    final encodedMessage = base64Url.encode(utf8.encode(emailContent)).replaceAll('=', '');
-    
-    // Create Gmail message object
-    final message = gmail.Message()..raw = encodedMessage;
-    
-    print('[EMAIL] Sending email via Gmail API (HTTPS port 443)...');
-    await gmailApi.users.messages.send(message, 'me');
-    
-    print('✅ Email sent successfully via Gmail API to $to');
-    httpClient.close();
+
+    final message = Message()
+      ..from = Address(smtpUser, 'LearnEase')
+      ..recipients.add(to)
+      ..subject = subject
+      ..html = body;
+
+    print('[EMAIL] Sending email via SMTP ($smtpHost:$smtpPort)...');
+    final sendReport = await send(message, smtpServer);
+    print('✅ Email sent successfully via SMTP to $to');
     return true;
-    
   } catch (e, stackTrace) {
-    print('❌ Failed to send email via Gmail API: $e');
+    print('❌ Failed to send email via SMTP: $e');
+    if (e.toString().contains('535')) {
+      print('[EMAIL] Gmail authentication failed. Use a Google App Password (16 chars) with 2-Step Verification enabled.');
+      print('[EMAIL] Do not use your regular Gmail account password for SMTP.');
+    }
     print('Stack trace: $stackTrace');
     return false;
   }
@@ -611,7 +689,76 @@ Future<bool> _sendEmail(String to, String subject, String body) async {
 // duplicate declarations removed
 
 void main(List<String> args) async {
-  final router = Router();
+     final router = Router();
+
+    // Admin registration endpoint
+    router.post('/api/admin/register', (Request request) async {
+      try {
+        final body = await request.readAsString();
+        final data = jsonDecode(body) as Map<String, dynamic>;
+        final email = (data['email'] as String?)?.trim().toLowerCase();
+        final password = data['password'] as String?;
+        final username = (data['username'] as String?)?.trim();
+        if (email == null || password == null || email.isEmpty || password.length < 6) {
+          return Response(400, body: jsonEncode({'error': 'Invalid email or password (min 6 chars)'}), headers: {'Content-Type': 'application/json'});
+        }
+        final hash = BCrypt.hashpw(password, BCrypt.gensalt());
+        final newId = uuid.v4();
+        final createdAt = DateTime.now().toIso8601String();
+        // Insert admin into MongoDB
+        if (mongoDb != null) {
+          final adminCollection = mongoDb!.collection('admin');
+          await adminCollection.insertOne({
+            'id': newId,
+            'email': email,
+            'password_hash': hash,
+            'username': username ?? email.split('@')[0],
+            'role': 'admin',
+            'created_at': createdAt,
+          });
+          print('✅ [DB_INSERT] Admin $newId inserted to MongoDB');
+          return Response.ok(jsonEncode({'success': true, 'id': newId}), headers: {'Content-Type': 'application/json'});
+        } else {
+          return Response.internalServerError(body: jsonEncode({'error': 'MongoDB not connected'}), headers: {'Content-Type': 'application/json'});
+        }
+      } catch (e) {
+        return Response.internalServerError(body: jsonEncode({'error': e.toString()}), headers: {'Content-Type': 'application/json'});
+      }
+    });
+    // Admin registration endpoint (correct placement)
+    router.post('/api/admin/register', (Request request) async {
+      try {
+        final body = await request.readAsString();
+        final data = jsonDecode(body) as Map<String, dynamic>;
+        final email = (data['email'] as String?)?.trim().toLowerCase();
+        final password = data['password'] as String?;
+        final username = (data['username'] as String?)?.trim();
+        if (email == null || password == null || email.isEmpty || password.length < 6) {
+          return Response(400, body: jsonEncode({'error': 'Invalid email or password (min 6 chars)'}), headers: {'Content-Type': 'application/json'});
+        }
+        final hash = BCrypt.hashpw(password, BCrypt.gensalt());
+        final newId = uuid.v4();
+        final createdAt = DateTime.now().toIso8601String();
+        // Insert admin into MongoDB
+        if (mongoDb != null) {
+          final adminCollection = mongoDb!.collection('admin');
+          await adminCollection.insertOne({
+            'id': newId,
+            'email': email,
+            'password_hash': hash,
+            'username': username ?? email.split('@')[0],
+            'role': 'admin',
+            'created_at': createdAt,
+          });
+          print('✅ [DB_INSERT] Admin $newId inserted to MongoDB');
+          return Response.ok(jsonEncode({'success': true, 'id': newId}), headers: {'Content-Type': 'application/json'});
+        } else {
+          return Response.internalServerError(body: jsonEncode({'error': 'MongoDB not connected'}), headers: {'Content-Type': 'application/json'});
+        }
+      } catch (e) {
+        return Response.internalServerError(body: jsonEncode({'error': e.toString()}), headers: {'Content-Type': 'application/json'});
+      }
+    });
   
   // Handle OPTIONS requests for CORS preflight
   router.options('/<path|.*>', (Request request) {
@@ -628,21 +775,16 @@ void main(List<String> args) async {
     // Try to read from environment first, then from .env files (in order of priority)
     var mongoUri = Platform.environment['MONGODB_URI'];
     
-    if (mongoUri == null) {
-      // Try community_server/.env
-      mongoUri = _readLocalEnvTop('MONGODB_URI', path: 'community_server/.env');
-    }
+    mongoUri ??= _readLocalEnvTop('MONGODB_URI', path: 'community_server/.env');
     
-    if (mongoUri == null) {
-      // Try .env in current directory
-      mongoUri = _readLocalEnvTop('MONGODB_URI', path: '.env');
-    }
+    mongoUri ??= _readLocalEnvTop('MONGODB_URI', path: '.env');
     
     if (mongoUri == null) {
       throw Exception('MONGODB_URI not found in environment or .env files');
     }
     
     print('🔌 Attempting to connect to MongoDB...');
+    print('📝 [DEBUG] Raw MongoDB URI: ' + mongoUri);
     print('📝 Connection URI: ${mongoUri.replaceAll(RegExp(r':[^@]+@'), ':***@')}'); // Log URI with password masked
     mongoDb = Db(mongoUri);
     await mongoDb!.open().timeout(const Duration(seconds: 10));
@@ -657,6 +799,9 @@ void main(List<String> args) async {
     
     print('✅ MongoDB connected successfully');
     print('✅ Collections initialized: contributions, quiz_results, challenge_results, users, sessions, email_otps');
+
+    // Ensure a default admin user exists so /api/auth/admin-login works out of the box
+    await _ensureDefaultAdminUser();
     
     // Log user count from MongoDB
     if (mongoUsersCollection != null) {
@@ -838,8 +983,21 @@ void main(List<String> args) async {
       final createdAt = DateTime.now().toIso8601String();
       final defaultUsername = username ?? email.split('@')[0];
       await _dbInsertUser(id: newId, email: email, password_hash: hash, phone: phone, google_id: null, created_at: createdAt, username: defaultUsername);
+      // Generate and send OTP after registration
+      final code = (100000 + (DateTime.now().millisecondsSinceEpoch % 899999)).toString();
+      final expires = DateTime.now().add(const Duration(minutes: 5));
+      _dbSaveEmailOtp(email, code, expires.toIso8601String(), 0);
+      final subject = 'LearnEase Registration OTP';
+      final bodyText = 'Your LearnEase registration OTP is: $code\nValid for 5 minutes.';
+      final sent = await _sendEmail(email, subject, bodyText);
       final tokens = _issueTokens(newId, email);
-      return Response.ok(jsonEncode({'token': tokens['accessToken'], 'refreshToken': tokens['refreshToken'], 'user': {'id': newId, 'email': email, 'phone': phone, 'username': defaultUsername}}), headers: {'Content-Type': 'application/json'});
+      return Response.ok(jsonEncode({
+        'token': tokens['accessToken'],
+        'refreshToken': tokens['refreshToken'],
+        'user': {'id': newId, 'email': email, 'phone': phone, 'username': defaultUsername},
+        'otpSent': sent,
+        'otpMessage': sent ? 'OTP sent to email' : 'OTP send failed, check server logs',
+      }), headers: {'Content-Type': 'application/json'});
     } catch (e) {
       return Response.internalServerError(body: jsonEncode({'error': e.toString()}), headers: {'Content-Type': 'application/json'});
     }
@@ -888,7 +1046,15 @@ void main(List<String> args) async {
       final role = isAdmin ? 'admin' : 'user';
       print('🔑 [LOGIN] User role determined: $role (isAdmin=$isAdmin)');
       
-      final tokens = _issueTokens(user['id'] as String, email, role: role);
+      final userId = user['id']?.toString();
+      if (userId == null || userId.isEmpty) {
+        print('❌ [LOGIN] User id missing for $email');
+        return Response.internalServerError(
+          body: jsonEncode({'error': 'User record is missing id'}),
+          headers: {'Content-Type': 'application/json'},
+        );
+      }
+      final tokens = _issueTokens(userId, email, role: role);
       print('✅ [LOGIN] Tokens issued for $email with role: $role');
       return Response.ok(jsonEncode({'token': tokens['accessToken'], 'refreshToken': tokens['refreshToken'], 'user': {'id': user['id'], 'email': user['email'], 'phone': user['phone'], 'role': role}}), headers: {'Content-Type': 'application/json'});
     } catch (e) {
@@ -905,11 +1071,11 @@ void main(List<String> args) async {
       final data = jsonDecode(body) as Map<String, dynamic>;
       final email = (data['email'] as String?)?.trim().toLowerCase();
       final password = data['password'] as String?;
-      final passkey = data['passkey'] as String?;
+      // Passkey removed
       
       print('👨‍💼 [ADMIN_LOGIN] Attempt for email: $email');
       
-      if (email == null || password == null || passkey == null) {
+      if (email == null || password == null) {
         print('❌ [ADMIN_LOGIN] Missing credentials');
         return Response(400, body: jsonEncode({'error': 'Missing credentials'}), headers: {'Content-Type': 'application/json'});
       }
@@ -923,24 +1089,29 @@ void main(List<String> args) async {
       
       // Verify password (use snake_case for MongoDB)
       final hash = user['password_hash'] as String?;
-      if (hash == null || !BCrypt.checkpw(password, hash)) {
+      print('[ADMIN_LOGIN] Debug: password entered = "$password"');
+      print('[ADMIN_LOGIN] Debug: hash from DB = "$hash"');
+      final passwordOk = hash != null && BCrypt.checkpw(password, hash);
+      print('[ADMIN_LOGIN] Debug: BCrypt.checkpw result = $passwordOk');
+      if (hash == null || !passwordOk) {
         print('❌ [ADMIN_LOGIN] Password check failed for $email (hash present: ${hash != null})');
         return Response(401, body: jsonEncode({'error': 'Invalid credentials'}), headers: {'Content-Type': 'application/json'});
       }
       
       print('✅ [ADMIN_LOGIN] Password verified for $email');
       
-      // Verify admin passkey (use snake_case for MongoDB)
-      final adminPasskeyHash = user['admin_passkey'] as String?;
-      if (adminPasskeyHash == null || !BCrypt.checkpw(passkey, adminPasskeyHash)) {
-        print('❌ [ADMIN_LOGIN] Invalid passkey for $email (passkey hash present: ${adminPasskeyHash != null})');
-        return Response(401, body: jsonEncode({'error': 'Invalid passkey'}), headers: {'Content-Type': 'application/json'});
-      }
-      
-      print('✅ [ADMIN_LOGIN] Passkey verified for $email');
+      // Passkey verification removed
       
       // Issue tokens with admin role
-      final tokens = _issueTokens(user['id'] as String, email, role: 'admin');
+      final userId = user['id']?.toString();
+      if (userId == null || userId.isEmpty) {
+        print('❌ [ADMIN_LOGIN] User id missing for $email');
+        return Response.internalServerError(
+          body: jsonEncode({'error': 'User record is missing id'}),
+          headers: {'Content-Type': 'application/json'},
+        );
+      }
+      final tokens = _issueTokens(userId, email, role: 'admin');
       print('✅ [ADMIN_LOGIN] Admin tokens issued for $email');
       
       return Response.ok(jsonEncode({
@@ -953,8 +1124,9 @@ void main(List<String> args) async {
           'role': 'admin'
         }
       }), headers: {'Content-Type': 'application/json'});
-    } catch (e) {
+    } catch (e, st) {
       print('❌ [ADMIN_LOGIN] Exception: $e');
+      print('❌ [ADMIN_LOGIN] StackTrace: $st');
       return Response.internalServerError(body: jsonEncode({'error': e.toString()}), headers: {'Content-Type': 'application/json'});
     }
   });
@@ -966,12 +1138,12 @@ void main(List<String> args) async {
       print('🔐 [ADMIN_RESET] Raw body: $body');
       final data = jsonDecode(body) as Map<String, dynamic>;
       final email = (data['email'] as String?)?.trim().toLowerCase();
-      final passkey = data['passkey'] as String?;
+      // Passkey removed
       final newPassword = data['newPassword'] as String?;
       
       print('🔐 [ADMIN_RESET] Attempt for email: $email');
       
-      if (email == null || passkey == null || newPassword == null) {
+      if (email == null || newPassword == null) {
         print('❌ [ADMIN_RESET] Missing parameters');
         return Response(400, body: jsonEncode({'error': 'Missing parameters'}), headers: {'Content-Type': 'application/json'});
       }
@@ -988,14 +1160,7 @@ void main(List<String> args) async {
         return Response(401, body: jsonEncode({'error': 'User not found'}), headers: {'Content-Type': 'application/json'});
       }
       
-      // Verify admin passkey
-      final adminPasskeyHash = user['admin_passkey'] as String?;
-      if (adminPasskeyHash == null || !BCrypt.checkpw(passkey, adminPasskeyHash)) {
-        print('❌ [ADMIN_RESET] Invalid passkey for $email');
-        return Response(401, body: jsonEncode({'error': 'Invalid passkey'}), headers: {'Content-Type': 'application/json'});
-      }
-      
-      print('✅ [ADMIN_RESET] Passkey verified for $email');
+      // Passkey verification removed
       
       // Hash the new password with BCrypt
       final newPasswordHash = BCrypt.hashpw(newPassword, BCrypt.gensalt());
@@ -1088,32 +1253,6 @@ void main(List<String> args) async {
   router.post('/api/auth/send-otp', (Request request) async {
     try {
       final body = await request.readAsString();
-    // Send OTP for registration (always sends, does NOT check if user exists)
-    router.post('/api/auth/send-signup-otp', (Request request) async {
-      try {
-        final body = await request.readAsString();
-        final data = jsonDecode(body) as Map<String, dynamic>;
-        final email = (data['email'] as String?)?.trim().toLowerCase();
-        if (email == null || !email.contains('@')) {
-          return Response(400, body: jsonEncode({'error': 'Invalid email'}), headers: {'Content-Type': 'application/json'});
-        }
-        final code = (100000 + (DateTime.now().millisecondsSinceEpoch % 899999)).toString();
-        final expires = DateTime.now().add(const Duration(minutes: 5));
-        _dbSaveEmailOtp(email, code, expires.toIso8601String(), 0);
-        print('[SIGNUP OTP] Email OTP saved for $email: $code (expires ${expires.toIso8601String()})');
-        final subject = 'LearnEase Registration OTP';
-        final body_text = 'Your LearnEase registration OTP is: $code\nValid for 5 minutes.';
-        final sent = await _sendEmail(email, subject, body_text);
-        print('[SIGNUP OTP] Email send result: ' + (sent ? 'SUCCESS' : 'FAILURE - using console fallback'));
-        
-        // Return success regardless of email send status (for development)
-        // In production, you would want email to succeed
-        return Response.ok(jsonEncode({'sent': true, 'code': code, 'message': sent ? 'Email sent' : 'Check console for OTP'}), headers: {'Content-Type': 'application/json'});
-      } catch (e) {
-        print('[SIGNUP OTP] Exception: $e');
-        return Response.internalServerError(body: jsonEncode({'error': e.toString()}), headers: {'Content-Type': 'application/json'});
-      }
-    });
       final data = jsonDecode(body) as Map<String, dynamic>;
       final phone = (data['phone'] as String?)?.trim();
       if (phone == null || phone.length < 6) return Response(400, body: jsonEncode({'error': 'Invalid phone'}), headers: {'Content-Type': 'application/json'});
@@ -1160,7 +1299,7 @@ void main(List<String> args) async {
             final uri = Uri.parse('https://api.twilio.com/2010-04-01/Accounts/$twSid/Messages.json');
             final bodyMap = {'From': twFrom, 'To': phone, 'Body': 'Your LearnEase OTP is: $code'};
             final resp = await http.post(uri, headers: {
-              'Authorization': 'Basic ' + base64Encode(utf8.encode('$twSid:$twToken'))
+              'Authorization': 'Basic ${base64Encode(utf8.encode('$twSid:$twToken'))}'
             }, body: bodyMap).timeout(const Duration(seconds: 10));
             if (resp.statusCode >= 200 && resp.statusCode < 300) {
               sentVia = 'twilio';
@@ -1265,25 +1404,27 @@ void main(List<String> args) async {
       print('[LOGIN OTP] ✅ Email OTP saved for $email: $code (expires ${expires.toIso8601String()})');
       
       final subject = 'LearnEase Login OTP';
-      final body_text = 'Your LearnEase login OTP is: $code\nValid for 5 minutes.';
-      
-      // Send email asynchronously (don't block response)
-      // ignore: unawaited_futures
-      _sendEmail(email, subject, body_text).then((sent) {
-        print('[LOGIN OTP] Email send result: ' + (sent ? 'SUCCESS' : 'FAILURE (dev mode - check console)'));
-      });
-      
-      // Return immediately (OTP is saved in DB, email will send in background)
-      print('[LOGIN OTP] ✅ Returning success immediately, email sending in background');
-      
-      // DEVELOPMENT MODE: Include OTP in response since email delivery is failing
-      // TODO: Remove 'code' from response in production
-      return Response.ok(jsonEncode({
-        'sent': true, 
-        'message': 'OTP sent to your email', 
-        'code': code,  // DEV ONLY - for testing when email fails
-        'dev_note': 'Email delivery may fail on Render due to SMTP blocking. Use this code to login.'
-      }), headers: {'Content-Type': 'application/json'});
+      final bodyText = 'Your LearnEase login OTP is: $code\nValid for 5 minutes.';
+
+      final sent = await _sendEmail(email, subject, bodyText);
+      print('[LOGIN OTP] Email send result: ${sent ? 'SUCCESS' : 'FAILURE'}');
+
+      if (!sent) {
+        _dbDeleteEmailOtp(email);
+        return Response(
+          503,
+          body: jsonEncode({
+            'sent': false,
+            'error': 'Unable to send OTP email right now. Please try again in a moment.'
+          }),
+          headers: {'Content-Type': 'application/json'},
+        );
+      }
+
+      return Response.ok(
+        jsonEncode({'sent': true, 'message': 'OTP sent to your email'}),
+        headers: {'Content-Type': 'application/json'},
+      );
     } catch (e) {
       print('[LOGIN OTP] ❌ Exception: $e');
       print('[LOGIN OTP] Stack: ${e.runtimeType}');
@@ -1313,10 +1454,26 @@ void main(List<String> args) async {
       print('[SIGNUP OTP] Email OTP saved for $email: $code (expires ${expires.toIso8601String()})');
       
       final subject = 'LearnEase Signup OTP';
-      final body_text = 'Your LearnEase signup OTP is: $code\nValid for 5 minutes.';
-      final sent = await _sendEmail(email, subject, body_text);
-      print('[SIGNUP OTP] Email send result: ' + (sent ? 'SUCCESS' : 'FAILURE'));
-      return Response.ok(jsonEncode({'sent': sent}), headers: {'Content-Type': 'application/json'});
+      final bodyText = 'Your LearnEase signup OTP is: $code\nValid for 5 minutes.';
+      final sent = await _sendEmail(email, subject, bodyText);
+      print('[SIGNUP OTP] Email send result: ${sent ? 'SUCCESS' : 'FAILURE'}');
+
+      if (!sent) {
+        _dbDeleteEmailOtp(email);
+        return Response(
+          503,
+          body: jsonEncode({
+            'sent': false,
+            'error': 'Unable to send OTP email right now. Please try again in a moment.'
+          }),
+          headers: {'Content-Type': 'application/json'},
+        );
+      }
+
+      return Response.ok(
+        jsonEncode({'sent': true, 'message': 'OTP sent to your email'}),
+        headers: {'Content-Type': 'application/json'},
+      );
     } catch (e) {
       print('[SIGNUP OTP] Exception: $e');
       return Response.internalServerError(body: jsonEncode({'error': e.toString()}), headers: {'Content-Type': 'application/json'});
@@ -1329,7 +1486,18 @@ void main(List<String> args) async {
       final body = await request.readAsString();
       final data = jsonDecode(body) as Map<String, dynamic>;
       final email = (data['email'] as String?)?.trim().toLowerCase();
-      final code = data['code'] as String?;
+      // ✅ FIX: Handle code as integer or string from JSON
+      var codeValue = data['code'];
+      String? code;
+      if (codeValue != null) {
+        if (codeValue is String) {
+          code = codeValue.trim();
+        } else if (codeValue is int) {
+          code = codeValue.toString();
+        } else {
+          code = codeValue.toString().trim();
+        }
+      }
       final newPassword = data['newPassword'] as String?;
       print('[RESET OTP] Verify attempt: email=$email, code=$code');
       if (email == null || code == null || newPassword == null || newPassword.length < 6) {
@@ -1349,9 +1517,15 @@ void main(List<String> args) async {
       if (DateTime.now().isAfter(expires)) {
         return Response(400, body: jsonEncode({'error': 'OTP expired'}), headers: {'Content-Type': 'application/json'});
       }
-      if (record['code'] != code) {
+      // ✅ FIX: Ensure stored code is also a string
+      var storedCode = record['code'];
+      if (storedCode is! String) {
+        storedCode = storedCode.toString();
+      }
+      storedCode = storedCode.trim();
+      if (storedCode != code) {
         final attempts = (record['attempts'] as int? ?? 0) + 1;
-        _dbSaveEmailOtp(email, record['code'] as String, record['expiresAt'] as String, attempts);
+        _dbSaveEmailOtp(email, storedCode, record['expiresAt'] as String, attempts);
         return Response(401, body: jsonEncode({'error': 'Invalid code'}), headers: {'Content-Type': 'application/json'});
       }
       // OTP valid, update password
@@ -1379,7 +1553,18 @@ void main(List<String> args) async {
       final body = await request.readAsString();
       final data = jsonDecode(body) as Map<String, dynamic>;
       final email = (data['email'] as String?)?.trim().toLowerCase();
-      final code = data['code'] as String?;
+      // ✅ FIX: Handle code as integer or string from JSON
+      var codeValue = data['code'];
+      String? code;
+      if (codeValue != null) {
+        if (codeValue is String) {
+          code = codeValue.trim();
+        } else if (codeValue is int) {
+          code = codeValue.toString();
+        } else {
+          code = codeValue.toString().trim();
+        }
+      }
       print('[VALIDATE RESET OTP] Checking: email=$email, code=$code');
       
       if (email == null || code == null) {
@@ -1399,11 +1584,18 @@ void main(List<String> args) async {
         return Response(400, body: jsonEncode({'error': 'OTP has expired'}), headers: {'Content-Type': 'application/json'});
       }
       
+      // ✅ FIX: Ensure stored code is also a string
+      var storedCode = record['code'];
+      if (storedCode is! String) {
+        storedCode = storedCode.toString();
+      }
+      storedCode = storedCode.trim();
+      
       // Check code match
-      if (record['code'] != code) {
-        print('[VALIDATE RESET OTP] ❌ Code mismatch. Expected: ${record['code']}, Got: $code');
+      if (storedCode != code) {
+        print('[VALIDATE RESET OTP] ❌ Code mismatch. Expected: $storedCode, Got: $code');
         final attempts = (record['attempts'] as int? ?? 0) + 1;
-        _dbSaveEmailOtp(email, record['code'] as String, record['expiresAt'] as String, attempts);
+        _dbSaveEmailOtp(email, storedCode, record['expiresAt'] as String, attempts);
         return Response(401, body: jsonEncode({'error': 'Invalid OTP code'}), headers: {'Content-Type': 'application/json'});
       }
       
@@ -1420,7 +1612,18 @@ void main(List<String> args) async {
       final body = await request.readAsString();
       final data = jsonDecode(body) as Map<String, dynamic>;
       final phone = (data['phone'] as String?)?.trim();
-      final code = data['code'] as String?;
+      // ✅ FIX: Handle code as integer or string from JSON
+      var codeValue = data['code'];
+      String? code;
+      if (codeValue != null) {
+        if (codeValue is String) {
+          code = codeValue.trim();
+        } else if (codeValue is int) {
+          code = codeValue.toString();
+        } else {
+          code = codeValue.toString().trim();
+        }
+      }
       print('🔍 Verify OTP attempt: phone=$phone, code=$code');
       if (phone == null || code == null) return Response(400, body: jsonEncode({'error': 'Missing phone or code'}), headers: {'Content-Type': 'application/json'});
       final record = _dbGetOtp(phone);
@@ -1432,10 +1635,16 @@ void main(List<String> args) async {
         print('⏰ OTP expired');
         return Response(400, body: jsonEncode({'error': 'OTP expired'}), headers: {'Content-Type': 'application/json'});
       }
-      if (record['code'] != code) {
+      // ✅ FIX: Ensure stored code is also a string
+      var storedCode = record['code'];
+      if (storedCode is! String) {
+        storedCode = storedCode.toString();
+      }
+      storedCode = storedCode.trim();
+      if (storedCode != code) {
         print('❌ OTP code mismatch');
         final attempts = (record['attempts'] as int? ?? 0) + 1;
-        _dbSaveOtp(phone, record['code'] as String, record['expiresAt'] as String, attempts);
+        _dbSaveOtp(phone, storedCode, record['expiresAt'] as String, attempts);
         return Response(401, body: jsonEncode({'error': 'Invalid code'}), headers: {'Content-Type': 'application/json'});
       }
       print('✅ OTP verified successfully');
@@ -1465,7 +1674,18 @@ void main(List<String> args) async {
       final body = await request.readAsString();
       final data = jsonDecode(body) as Map<String, dynamic>;
       final email = (data['email'] as String?)?.trim().toLowerCase();
-      final code = data['code'] as String?;
+      // ✅ FIX: Handle code as integer or string from JSON
+      var codeValue = data['code'];
+      String? code;
+      if (codeValue != null) {
+        if (codeValue is String) {
+          code = codeValue.trim();
+        } else if (codeValue is int) {
+          code = codeValue.toString();
+        } else {
+          code = codeValue.toString().trim();
+        }
+      }
       final password = data['password'] as String?;
       final username = (data['username'] as String?)?.trim();
       
@@ -1490,14 +1710,20 @@ void main(List<String> args) async {
         return Response(400, body: jsonEncode({'error': 'OTP expired'}), headers: {'Content-Type': 'application/json'});
       }
       
-      final storedCode = record['code'] as String;
+      var storedCode = record['code'];
+      // ✅ FIX: Ensure stored code is also a string
+      if (storedCode is! String) {
+        storedCode = storedCode.toString();
+      }
+      storedCode = (storedCode as String).trim();
+      
       print('[EMAIL OTP] 🔍 Code Comparison:');
-      print('[EMAIL OTP]   Stored Type: ${storedCode.runtimeType}, Value: "$storedCode" (length=${storedCode.length})');
-      print('[EMAIL OTP]   Provided Type: ${code.runtimeType}, Value: "$code" (length=${code.length})');
+      print('[EMAIL OTP]   Stored: "$storedCode" (length=${storedCode.length})');
+      print('[EMAIL OTP]   Provided: "$code" (length=${code.length})');
       print('[EMAIL OTP]   Match: ${storedCode == code}');
       
       if (storedCode != code) {
-        print('[EMAIL OTP] ❌ OTP code mismatch: "$storedCode" != "$code"');
+        print('[EMAIL OTP] ❌ Code mismatch: "$storedCode" != "$code"');
         final attempts = (record['attempts'] as int? ?? 0) + 1;
         _dbSaveEmailOtp(email, storedCode, record['expiresAt'] as String, attempts);
         return Response(401, body: jsonEncode({'error': 'Invalid OTP code'}), headers: {'Content-Type': 'application/json'});
@@ -2696,7 +2922,7 @@ void main(List<String> args) async {
       print('❌ [ADMIN] Error in bulk delete: $e');
       return Response.internalServerError(body: jsonEncode({'error': 'Failed to delete contributions: $e'}), headers: {'Content-Type': 'application/json'});
     }
-  });;
+  });
 
   // ADMIN ROUTES END  // Get contributions by category (public - only approved)
   router.get('/api/contributions/<category>', (Request request, String category) async {
@@ -3225,21 +3451,69 @@ void main(List<String> args) async {
       final systemPrompt =
           'You are an assistant for the LearnEase project. Answer only about topics relevant to this project (Java, DBMS, quizzes, code examples, contributions, Flutter integration, server API). Be concise and avoid unrelated content.';
       final payload = jsonEncode({
-        'prompt': {
-          'text': '$systemPrompt\nUser: $input'
-        },
-        'temperature': 0.2
+        'contents': [
+          {
+            'role': 'user',
+            'parts': [
+              {'text': '$systemPrompt\n\nUser: $input'},
+            ],
+          }
+        ],
+        'generationConfig': {
+          'temperature': 0.2,
+        }
       });
 
+      // Discover an available model that supports generateContent for this key/project.
+      // Cached for the lifetime of the process.
+      String? discoveredModel;
+      Future<String?> discoverModel() async {
+        if (discoveredModel != null && discoveredModel!.isNotEmpty) return discoveredModel;
+        try {
+          final listUri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models?key=$geminiKey');
+          final listResp = await http.get(listUri).timeout(const Duration(seconds: 20));
+          if (listResp.statusCode < 200 || listResp.statusCode >= 300) return null;
+          final decoded = jsonDecode(listResp.body);
+          final models = decoded is Map ? decoded['models'] : null;
+          if (models is! List) return null;
+
+          String? pick;
+          for (final item in models) {
+            if (item is! Map) continue;
+            final name = item['name']?.toString();
+            if (name == null || name.isEmpty) continue;
+            final supported = item['supportedGenerationMethods'];
+            if (supported is List && supported.any((m) => m.toString() == 'generateContent')) {
+              pick = name;
+              // Prefer a flash-style model if present
+              if (name.contains('flash')) {
+                break;
+              }
+            }
+          }
+          discoveredModel = pick;
+          return pick;
+        } catch (_) {
+          return null;
+        }
+      }
+
       // Helper to call Gemini for a given model string
-      Future<http.Response> _callGemini(String m) async {
-        final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta2/$m:generateText?key=$geminiKey');
+      Future<http.Response> callGemini(String m) async {
+        final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/$m:generateContent?key=$geminiKey');
         return await http.post(uri, headers: {'Content-Type': 'application/json'}, body: payload).timeout(const Duration(seconds: 30));
       }
 
       // Try the requested model first, then fallback to a short list of known models if we get NOT_FOUND.
   final envDefault = _readLocalEnvTop('AI_MODEL') ?? _readLocalEnvTop('AI_MODEL', path: '../.env');
-  final List<String> tryModels = [model, envDefault, 'models/text-bison-001', 'models/chat-bison-001']
+  final List<String> tryModels = [
+            model,
+            envDefault,
+            // Common modern Gemini model names
+            'models/gemini-1.5-flash',
+            'models/gemini-1.5-pro',
+            'models/gemini-1.0-pro',
+          ]
           .where((s) => s != null && s.trim().isNotEmpty)
           .map((s) => s!.trim())
           .toList();
@@ -3247,7 +3521,7 @@ void main(List<String> args) async {
       http.Response? resp;
       for (final tryModel in tryModels) {
         try {
-          resp = await _callGemini(tryModel);
+          resp = await callGemini(tryModel);
         } catch (e) {
           // network/timeout — continue to next
           resp = null;
@@ -3261,6 +3535,18 @@ void main(List<String> args) async {
         } else {
           // some other error — stop trying
           break;
+        }
+      }
+
+      // If we got NOT_FOUND for all common models, try auto-discovery via ListModels.
+      if (resp != null && resp.statusCode == 404) {
+        final auto = await discoverModel();
+        if (auto != null && auto.isNotEmpty) {
+          try {
+            resp = await callGemini(auto);
+          } catch (_) {
+            // ignore; will fall back below
+          }
         }
       }
 
@@ -3309,10 +3595,19 @@ void main(List<String> args) async {
       final decoded = jsonDecode(resp.body);
       String reply = '';
       if (decoded is Map) {
+        // v1beta generateContent
         if (decoded['candidates'] is List && decoded['candidates'].isNotEmpty) {
           final cand = decoded['candidates'][0];
-          if (cand is Map && cand['content'] != null) reply = cand['content'].toString();
+          final content = cand is Map ? cand['content'] : null;
+          final parts = content is Map ? content['parts'] : null;
+          if (parts is List && parts.isNotEmpty) {
+            final first = parts[0];
+            if (first is Map && first['text'] != null) {
+              reply = first['text'].toString();
+            }
+          }
         }
+        // older schema fallback
         if (reply.isEmpty && decoded['output'] is Map && decoded['output']['text'] != null) {
           reply = decoded['output']['text'].toString();
         }
@@ -3330,7 +3625,7 @@ void main(List<String> args) async {
       final body = await request.readAsString();
       final logMsg = '[RESET OTP] Received send-reset-otp request: ' + body;
       print(logMsg);
-      File('reset_otp_debug.log').writeAsStringSync(logMsg + '\n', mode: FileMode.append);
+      File('reset_otp_debug.log').writeAsStringSync('$logMsg\n', mode: FileMode.append);
       final data = jsonDecode(body) as Map<String, dynamic>;
       final email = (data['email'] as String?)?.trim().toLowerCase();
       if (email == null || !email.contains('@')) return Response(400, body: jsonEncode({'error': 'Invalid email'}), headers: {'Content-Type': 'application/json'});
@@ -3348,9 +3643,9 @@ void main(List<String> args) async {
       File('reset_otp_debug.log').writeAsStringSync('[RESET OTP] OTP Saved: email=$email, code=$code\n', mode: FileMode.append);
       print('[RESET OTP] Email OTP saved for $email: $code (expires ${expires.toIso8601String()})');
       final subject = 'LearnEase Password Reset OTP';
-      final body_text = 'Your LearnEase password reset OTP is: $code\nValid for 5 minutes.';
-      final sent = await _sendEmail(email, subject, body_text);
-      print('[RESET OTP] Email send result: ' + (sent ? 'SUCCESS' : 'FAILURE'));
+      final bodyText = 'Your LearnEase password reset OTP is: $code\nValid for 5 minutes.';
+      final sent = await _sendEmail(email, subject, bodyText);
+      print('[RESET OTP] Email send result: ${sent ? 'SUCCESS' : 'FAILURE'}');
       return Response.ok(jsonEncode({'sent': sent}), headers: {'Content-Type': 'application/json'});
     } catch (e) {
       print('[RESET OTP] Exception: $e');
@@ -3410,9 +3705,9 @@ void main(List<String> args) async {
       print('[DELETE ACCOUNT OTP] ✅ OTP saved for $email: $code');
 
       final subject = 'LearnEase Account Deletion OTP';
-      final body_text = 'Your LearnEase account deletion OTP is: $code\nValid for 10 minutes.\n\n⚠️ WARNING: This action is IRREVERSIBLE. All your data, contributions, and progress will be permanently deleted.';
-      final sent = await _sendEmail(email, subject, body_text);
-      print('[DELETE ACCOUNT OTP] Email send result: ' + (sent ? 'SUCCESS' : 'FAILURE'));
+      final bodyText = 'Your LearnEase account deletion OTP is: $code\nValid for 10 minutes.\n\n⚠️ WARNING: This action is IRREVERSIBLE. All your data, contributions, and progress will be permanently deleted.';
+      final sent = await _sendEmail(email, subject, bodyText);
+      print('[DELETE ACCOUNT OTP] Email send result: ${sent ? 'SUCCESS' : 'FAILURE'}');
       return Response.ok(jsonEncode({'sent': sent, 'message': 'OTP sent to your email'}), headers: {'Content-Type': 'application/json'});
     } catch (e) {
       print('[DELETE ACCOUNT OTP] Exception: $e');
@@ -3523,7 +3818,7 @@ void main(List<String> args) async {
   });
 
   // Start server
-  final port = int.tryParse(Platform.environment['PORT'] ?? '8080') ?? 8080;
+  final port = int.tryParse(Platform.environment['PORT'] ?? '8081') ?? 8081;
   final server = await io.serve(handler, InternetAddress.anyIPv4, port);
   print('🚀 Community Server running on http://localhost:${server.port}');
 }

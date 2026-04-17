@@ -58,13 +58,8 @@ class _SignInScreenState extends State<SignInScreen> {
         _otpSent = true;
         _showSignUpOption = false;
       });
-      
-      // Show OTP code if email delivery failed (dev mode)
-      if (resp.containsKey('code') && resp['code'] != null) {
-        _showNotification('⚠️ Email failed! Use this OTP: ${resp['code']}', isSuccess: true);
-      } else {
-        _showNotification('OTP sent to your email', isSuccess: true);
-      }
+
+      _showNotification('OTP sent to your email', isSuccess: true);
     } else {
       final err = resp['error'] ?? 'Failed to send OTP';
       final isUnregisteredEmail = err.toString().toLowerCase().contains('invalid credentials') ||
@@ -305,7 +300,7 @@ class _SignInScreenState extends State<SignInScreen> {
                     labelText: 'Enter OTP',
                     prefixIcon: Icon(Icons.verified_user),
                     border: OutlineInputBorder(),
-                    hintText: 'Check server console for OTP',
+                    hintText: 'Check your email for OTP',
                   ),
                   enabled: !_loading,
                   keyboardType: TextInputType.number,

@@ -21,7 +21,7 @@ android {
 
     defaultConfig {
         applicationId = "com.learnease.app"
-        minSdk = 21  // Updated for better compatibility
+        minSdk = flutter.minSdkVersion  // Updated for better compatibility
         targetSdk = 34  // Latest stable Android version
         versionCode = 1
         versionName = "1.0.0"

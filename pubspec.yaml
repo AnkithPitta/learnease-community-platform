@@ -44,7 +44,7 @@ dependencies:
   flutter_dotenv: ^6.0.0
   google_sign_in: ^6.1.1
   intl_phone_number_input: ^0.7.5
-  file_picker: ^6.2.0
+  file_picker: ^8.3.7
 
 dev_dependencies:
   flutter_test:

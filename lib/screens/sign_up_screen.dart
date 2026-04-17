@@ -79,7 +79,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
         _loading = false;
         _emailTaken = true;
       });
-      _showNotification('Email is already registered', isSuccess: false);
+      _showNotification('Email is already registered. Please use Sign In to receive login OTP.', isSuccess: false);
       return;
     }
     
@@ -94,10 +94,14 @@ class _SignUpScreenState extends State<SignUpScreen> {
     // Send OTP for signup (registration)
     final otpResp = await _authService.sendSignupOtp(email);
     setState(() => _loading = false);
-    
+
     if (otpResp['sent'] == true) {
       setState(() => _step = 1);
-      _showNotification('OTP sent to your email! Please check the server console for the OTP code.', isSuccess: true);
+      if (otpResp['code'] != null) {
+        _showNotification('Email failed in dev mode. Use OTP: ${otpResp['code']}', isSuccess: true);
+      } else {
+        _showNotification('OTP sent to your email!', isSuccess: true);
+      }
     } else {
       final err = otpResp['error'] ?? 'Failed to send OTP';
       _showNotification(err.toString(), isSuccess: false);

@@ -538,7 +538,6 @@ class _ProfileScreenState extends State<ProfileScreen> with SingleTickerProvider
                               builder: (_) => AdminLoginScreen(
                                 onLoginSuccess: () async {
                                   print('[ProfileScreen] 🔓 Admin login successful!');
-                                  // Only trigger admin check; do not pop any routes here.
                                   if (mounted) {
                                     final mainNavState = MainNavigation.globalKey.currentState;
                                     if (mainNavState != null) {

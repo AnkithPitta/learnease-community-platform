@@ -19,6 +19,44 @@ void main() async {
     print('❌ Passkey must be at least 6 characters');
     exit(1);
   }
+    // Sample course content for admin setup
+    final courseContent = {
+      'title': 'Introduction to Dart',
+      'description': 'Learn the basics of Dart programming language, syntax, and features.',
+      'modules': [
+        {
+          'name': 'Getting Started',
+          'topics': ['Setup', 'Hello World', 'Basic Syntax']
+        },
+        {
+          'name': 'Data Types',
+          'topics': ['Numbers', 'Strings', 'Lists', 'Maps']
+        },
+        {
+          'name': 'Functions & Classes',
+          'topics': ['Defining Functions', 'Class Basics', 'Inheritance']
+        }
+      ]
+    };
+
+    // Sample quiz questions for admin setup
+    final quizQuestions = [
+      {
+        'question': 'What is the keyword to define a function in Dart?',
+        'options': ['func', 'def', 'void', 'function'],
+        'answer': 'void'
+      },
+      {
+        'question': 'Which data type is used to store a sequence of values?',
+        'options': ['Map', 'List', 'String', 'Int'],
+        'answer': 'List'
+      },
+      {
+        'question': 'How do you print output in Dart?',
+        'options': ['echo()', 'print()', 'console.log()', 'output()'],
+        'answer': 'print()'
+      }
+    ];
   
   print('');
   print('⚠️  WARNING: This will UPDATE the admin_passkey in PRODUCTION MongoDB!');

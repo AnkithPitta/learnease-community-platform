@@ -1,6 +1,6 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
-import 'auth_service.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import '../config/api_config.dart';
 
@@ -26,7 +26,10 @@ class AIService {
       }
     }
 
-    final proxyBase = safeEnv('AI_PROXY_BASE', safeEnv('AI_API_BASE', '${ApiConfig.webBaseUrl}/api/ai'));
+    // Always use the app backend as AI proxy.
+    // This avoids repeated Flutter Web failures caused by stale AI_* env overrides
+    // (e.g. AI_PROXY_BASE=http://127.0.0.1:8080).
+    final proxyBase = '${ApiConfig.baseUrl}/api/ai';
     final timeoutMs = int.tryParse(safeEnv('AI_TIMEOUT_MS', '15000')) ?? 15000;
     final model = safeEnv('AI_MODEL', 'models/gemini-1');
 
@@ -37,14 +40,19 @@ class AIService {
   Future<String> sendMessage(String message) async {
     final uri = Uri.parse(baseUrl);
     final body = jsonEncode({'provider': provider, 'model': model, 'input': message});
-    final headers = {'Content-Type': 'application/json'};
-
-  final resp = await AuthService().authenticatedRequest(
-      'POST',
-      uri.path,
-      body: {'provider': provider, 'model': model, 'input': message},
-      additionalHeaders: headers,
-    );
+    if (kDebugMode) {
+      debugPrint('[AIService] POST $uri');
+    }
+    final resp = await http
+        .post(
+          uri,
+          headers: const {'Content-Type': 'application/json'},
+          body: body,
+        )
+        .timeout(timeout);
+    if (kDebugMode) {
+      debugPrint('[AIService] status=${resp.statusCode}');
+    }
     if (resp.statusCode < 200 || resp.statusCode >= 300) {
       throw http.ClientException('Proxy AI error: ${resp.statusCode} ${resp.body}');
     }

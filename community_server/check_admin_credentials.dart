@@ -94,7 +94,7 @@ void main() async {
       }
     }
     
-    print('\n' + '=' * 60);
+    print('\n${'=' * 60}');
     print('SUMMARY:');
     print('=' * 60);
     

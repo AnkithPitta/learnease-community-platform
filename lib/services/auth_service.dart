@@ -61,6 +61,8 @@ import '../config/api_config.dart';
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove('access_token');
       await prefs.remove('refresh_token');
+      await prefs.remove('user_email');
+      await prefs.remove('user_name');
       await clearUserRole();
     }
 
@@ -123,9 +125,9 @@ import '../config/api_config.dart';
       try {
         final token = await getToken();
         
-        // No token = not valid
+        // No token = guest state; do not treat as an error
         if (token == null || token.isEmpty) {
-          print('[AuthService] ❌ No token found, treating as invalid');
+          print('[AuthService] ℹ️ No token stored; treating as guest for validation');
           return false;
         }
         
@@ -251,7 +253,8 @@ import '../config/api_config.dart';
         ).timeout(const Duration(seconds: 10));
         
         print('[AuthService] Response status: ${resp.statusCode}');
-        print('[AuthService] Response body: ${resp.body.substring(0, 200)}');
+        final preview = resp.body.length > 200 ? resp.body.substring(0, 200) : resp.body;
+        print('[AuthService] Response body: $preview');
         
         final data = jsonDecode(resp.body) as Map<String, dynamic>;
         if (data.containsKey('token') && data.containsKey('refreshToken')) {
@@ -549,8 +552,8 @@ import '../config/api_config.dart';
       return data;
     }
 
-    // Admin login with passkey instead of OTP
-    Future<Map<String, dynamic>> adminLogin(String email, String password, String passkey) async {
+    // Admin login (passkey removed, now only email and password)
+    Future<Map<String, dynamic>> adminLogin(String email, String password) async {
       final uri = Uri.parse('$_base/api/auth/admin-login');
       try {
         final resp = await http.post(
@@ -559,7 +562,6 @@ import '../config/api_config.dart';
           body: jsonEncode({
             'email': email,
             'password': password,
-            'passkey': passkey,
           }),
         ).timeout(const Duration(seconds: 15));
         
@@ -596,7 +598,7 @@ import '../config/api_config.dart';
       }
     }
 
-    Future<Map<String, dynamic>> resetAdminPassword(String email, String passkey, String newPassword) async {
+    Future<Map<String, dynamic>> resetAdminPassword(String email, String newPassword) async {
       final uri = Uri.parse('$_base/api/auth/admin-reset-password');
       try {
         print('[AuthService] 🔐 Attempting admin password reset for: $email');
@@ -605,7 +607,6 @@ import '../config/api_config.dart';
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
             'email': email,
-            'passkey': passkey,
             'newPassword': newPassword,
           }),
         ).timeout(const Duration(seconds: 15));

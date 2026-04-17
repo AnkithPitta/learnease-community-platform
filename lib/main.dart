@@ -16,6 +16,9 @@ import 'widgets/theme_toggle_button.dart';
 import 'services/auth_service.dart';
 import 'models/user.dart';
 import 'utils/error_handler.dart';
+import 'widgets/global_chat_launcher.dart';
+
+final GlobalKey<NavigatorState> _rootNavigatorKey = GlobalKey<NavigatorState>();
 
 Future<void> main() async {
   // Initialize Flutter binding
@@ -53,8 +56,19 @@ class LearnEaseApp extends StatelessWidget {
           theme: AppTheme.lightTheme,
           darkTheme: AppTheme.darkTheme,
           themeMode: themeProvider.themeMode,
+          navigatorKey: _rootNavigatorKey,
           home: const SplashScreen(),
           debugShowCheckedModeBanner: false,
+          builder: (context, child) {
+            return Stack(
+              children: [
+                child ?? const SizedBox.shrink(),
+                GlobalChatLauncher(
+                  navigatorContext: _rootNavigatorKey.currentContext ?? context,
+                ),
+              ],
+            );
+          },
         );
       },
     );
@@ -127,7 +141,21 @@ class _MainNavigationState extends State<MainNavigation> with WidgetsBindingObse
     try {
       print('[MainNav] ⏳ Checking admin status...');
       
-      // First validate if token is actually valid (not expired)
+      // Fast path: if there is no stored token at all, treat as guest
+      final token = await AuthService().getToken();
+      if (token == null || token.isEmpty) {
+        print('[MainNav] No token stored; treating as guest user');
+        if (mounted && !_isInitialized) {
+          setState(() {
+            _isAdmin = false;
+            _isInitialized = true;
+            _selectedIndex = 0; // Go to home screen
+          });
+        }
+        return;
+      }
+      
+      // Validate if token is actually valid (not expired)
       final isTokenValid = await AuthService().isTokenValid();
       print('[MainNav] Token valid: $isTokenValid');
       
@@ -188,6 +216,20 @@ class _MainNavigationState extends State<MainNavigation> with WidgetsBindingObse
     try {
       // Brief delay to ensure persistence
       await Future.delayed(const Duration(milliseconds: 200));
+      
+      // If there is no token at all, just mark as guest and exit
+      final token = await AuthService().getToken();
+      if (token == null || token.isEmpty) {
+        print('[MainNav] Force check - No token stored; treating as guest');
+        if (mounted) {
+          setState(() {
+            _isAdmin = false;
+            _isInitialized = true;
+            _selectedIndex = 0;
+          });
+        }
+        return;
+      }
       
       // Validate token first
       final isTokenValid = await AuthService().isTokenValid();
@@ -251,7 +293,14 @@ class _MainNavigationState extends State<MainNavigation> with WidgetsBindingObse
   /// Public method to force immediate admin check - called from ProfileScreen after admin login
   void forceCheckAdminStatusImmediate() {
     print('[MainNav] 🔴 PUBLIC FORCE CHECK called from ProfileScreen - executing immediately');
-    _forceCheckAdminStatus();
+    _forceCheckAdminStatus().then((_) {
+      if (mounted && _isAdmin) {
+        setState(() {
+          _selectedIndex = 4;
+        });
+        print('[MainNav] ✅ Switched to admin dashboard after login');
+      }
+    });
   }
 
   /// Public method to switch tabs - called from ProfileScreen after admin login to force re-render
@@ -299,6 +348,20 @@ class _MainNavigationState extends State<MainNavigation> with WidgetsBindingObse
       print('[MainNav]   Email: $email');
       print('[MainNav]   Role: $role');
       print('[MainNav]   Current _isAdmin: $_isAdmin');
+      
+      // If there is no token, ensure we are in a clean guest state
+      if (token == null || token.isEmpty) {
+        print('[MainNav]   No token on profile; clearing stored identity to guest');
+        await AuthService().clearTokens();
+        if (mounted) {
+          setState(() {
+            _isAdmin = false;
+            _isInitialized = true;
+          });
+        }
+        print('[MainNav] ✅ Guest profile state applied');
+        return;
+      }
       
       final isAdmin = role == UserRole.admin;
       print('[MainNav]   Calculated isAdmin: $isAdmin');

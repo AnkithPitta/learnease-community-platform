@@ -1,6 +1,7 @@
 /// Script to automatically update ngrok URL in api_config.dart
 /// Run this whenever ngrok URL changes
 /// Usage: dart scripts/update_ngrok_url.dart
+library;
 
 import 'dart:io';
 import 'dart:convert';
